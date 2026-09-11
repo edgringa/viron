@@ -26,7 +26,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Viron API",
-    version: "0.6.0"
+    version: "0.7.0"
   });
 });
 
@@ -55,6 +55,14 @@ app.get("/db-test", async (_req, res) => {
   }
 });
 
+
+/*
+  VIRÓN SEARCH
+  Busca por relevância:
+  - título = peso maior
+  - descrição = peso médio
+  - conteúdo = peso menor
+*/
 app.get("/search", async (req, res) => {
   const query = String(req.query.q || "").trim();
 
@@ -68,16 +76,47 @@ app.get("/search", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT id, title, url, description
+      SELECT
+        id,
+        title,
+        url,
+        description,
+
+        (
+          CASE
+            WHEN title ILIKE $1 THEN 100
+            WHEN title ILIKE $2 THEN 80
+            ELSE 0
+          END
+          +
+          CASE
+            WHEN description ILIKE $1 THEN 50
+            WHEN description ILIKE $2 THEN 30
+            ELSE 0
+          END
+          +
+          CASE
+            WHEN content ILIKE $1 THEN 20
+            WHEN content ILIKE $2 THEN 10
+            ELSE 0
+          END
+        ) AS relevance
+
       FROM search_pages
+
       WHERE
-        title ILIKE $1
-        OR description ILIKE $1
-        OR content ILIKE $1
-      ORDER BY id DESC
+        title ILIKE $2
+        OR description ILIKE $2
+        OR content ILIKE $2
+
+      ORDER BY relevance DESC, id DESC
+
       LIMIT 10
       `,
-      [`%${query}%`]
+      [
+        query,
+        `%${query}%`
+      ]
     );
 
     res.json({
@@ -86,12 +125,13 @@ app.get("/search", async (req, res) => {
       results: result.rows.map(row => ({
         title: row.title,
         url: row.url,
-        description: row.description
+        description: row.description,
+        relevance: Number(row.relevance)
       }))
     });
 
   } catch (error) {
-    console.error(error);
+    console.error("Search error:", error);
 
     res.status(500).json({
       ok: false,
@@ -100,6 +140,10 @@ app.get("/search", async (req, res) => {
   }
 });
 
+
+/*
+  Adiciona URL à fila do crawler.
+*/
 app.post("/crawl", async (req, res) => {
   const url = String(req.body.url || "").trim();
 
@@ -111,7 +155,15 @@ app.post("/crawl", async (req, res) => {
   }
 
   try {
-    new URL(url);
+    const parsedUrl = new URL(url);
+
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Only HTTP and HTTPS URLs are allowed"
+      });
+    }
+
   } catch {
     return res.status(400).json({
       ok: false,
@@ -154,6 +206,7 @@ app.post("/crawl", async (req, res) => {
     });
   }
 });
+
 
 /*
   Processa uma URL pendente.
@@ -218,7 +271,8 @@ async function processNextUrl() {
       "";
 
     const content =
-      $("body").text()
+      $("body")
+        .text()
         .replace(/\s+/g, " ")
         .trim()
         .slice(0, 50000);
@@ -279,7 +333,10 @@ async function processNextUrl() {
         `
       );
     } catch (updateError) {
-      console.error("Queue update error:", updateError.message);
+      console.error(
+        "Queue update error:",
+        updateError.message
+      );
     }
   } finally {
     if (client) {
@@ -288,11 +345,18 @@ async function processNextUrl() {
   }
 }
 
+
 /*
   Executa o crawler periodicamente.
 */
 setInterval(processNextUrl, 10000);
 
+
+/*
+  Inicia a API.
+*/
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Viron API running on port ${PORT}`);
+  console.log(
+    `Viron API running on port ${PORT}`
+  );
 });
