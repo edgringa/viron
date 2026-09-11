@@ -4,6 +4,12 @@ const { Pool } = require("pg");
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Permite que o Viron Search (Vercel) converse com a API (Render)
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  next();
+});
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -15,7 +21,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Viron API",
-    version: "0.2.0"
+    version: "0.3.0"
   });
 });
 
@@ -42,6 +48,30 @@ app.get("/db-test", async (_req, res) => {
       database: "error"
     });
   }
+});
+
+// PRIMEIRA VERSÃO DO MOTOR DE PESQUISA
+app.get("/search", async (req, res) => {
+  const query = String(req.query.q || "").trim();
+
+  if (!query) {
+    return res.status(400).json({
+      ok: false,
+      error: "Query is required"
+    });
+  }
+
+  res.json({
+    ok: true,
+    query: query,
+    results: [
+      {
+        title: `Resultados para "${query}"`,
+        url: "https://viron.search",
+        description: "O mecanismo de busca do Viron está sendo construído."
+      }
+    ]
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
