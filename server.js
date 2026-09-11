@@ -71,6 +71,7 @@ app.get("/search", async (req, res) => {
       WHERE
         title ILIKE $1
         OR description ILIKE $1
+        OR content ILIKE $1
       ORDER BY id DESC
       LIMIT 10
       `,
