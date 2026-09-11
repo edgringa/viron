@@ -1,5 +1,7 @@
 const express = require("express");
 const { Pool } = require("pg");
+const axios = require("axios");
+const cheerio = require("cheerio");
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -24,7 +26,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Viron API",
-    version: "0.5.0"
+    version: "0.6.0"
   });
 });
 
@@ -66,11 +68,7 @@ app.get("/search", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      SELECT
-        id,
-        title,
-        url,
-        description
+      SELECT id, title, url, description
       FROM search_pages
       WHERE
         title ILIKE $1
@@ -84,7 +82,7 @@ app.get("/search", async (req, res) => {
 
     res.json({
       ok: true,
-      query: query,
+      query,
       results: result.rows.map(row => ({
         title: row.title,
         url: row.url,
@@ -102,9 +100,6 @@ app.get("/search", async (req, res) => {
   }
 });
 
-/*
-  Adiciona uma URL à fila do Viron Crawler
-*/
 app.post("/crawl", async (req, res) => {
   const url = String(req.body.url || "").trim();
 
@@ -140,7 +135,7 @@ app.post("/crawl", async (req, res) => {
       return res.json({
         ok: true,
         message: "URL already in crawl queue",
-        url: url
+        url
       });
     }
 
@@ -159,6 +154,144 @@ app.post("/crawl", async (req, res) => {
     });
   }
 });
+
+/*
+  Processa uma URL pendente.
+*/
+async function processNextUrl() {
+  let client;
+
+  try {
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+
+    const queueResult = await client.query(
+      `
+      SELECT id, url
+      FROM crawl_queue
+      WHERE status = 'pending'
+      ORDER BY id ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+      `
+    );
+
+    if (queueResult.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return;
+    }
+
+    const item = queueResult.rows[0];
+
+    await client.query(
+      `
+      UPDATE crawl_queue
+      SET status = 'processing'
+      WHERE id = $1
+      `,
+      [item.id]
+    );
+
+    await client.query("COMMIT");
+
+    console.log(`Crawling: ${item.url}`);
+
+    const response = await axios.get(item.url, {
+      timeout: 15000,
+      maxContentLength: 5 * 1024 * 1024,
+      headers: {
+        "User-Agent": "VironBot/0.1 (+https://viron.search)"
+      }
+    });
+
+    const $ = cheerio.load(response.data);
+
+    $("script, style, noscript").remove();
+
+    const title =
+      $("title").first().text().trim() ||
+      item.url;
+
+    const description =
+      $('meta[name="description"]').attr("content")?.trim() ||
+      "";
+
+    const content =
+      $("body").text()
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 50000);
+
+    const language =
+      $("html").attr("lang")?.trim() || null;
+
+    await pool.query(
+      `
+      INSERT INTO search_pages
+      (title, url, description, content, language, country)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      `,
+      [
+        title,
+        item.url,
+        description,
+        content,
+        language,
+        null
+      ]
+    );
+
+    await pool.query(
+      `
+      UPDATE crawl_queue
+      SET status = 'completed'
+      WHERE id = $1
+      `,
+      [item.id]
+    );
+
+    console.log(`Indexed successfully: ${item.url}`);
+
+  } catch (error) {
+
+    console.error("Crawler error:", error.message);
+
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {}
+    }
+
+    try {
+      await pool.query(
+        `
+        UPDATE crawl_queue
+        SET status = 'error'
+        WHERE status = 'processing'
+        AND id = (
+          SELECT id
+          FROM crawl_queue
+          WHERE status = 'processing'
+          ORDER BY id ASC
+          LIMIT 1
+        )
+        `
+      );
+    } catch (updateError) {
+      console.error("Queue update error:", updateError.message);
+    }
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+}
+
+/*
+  Executa o crawler periodicamente.
+*/
+setInterval(processNextUrl, 10000);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Viron API running on port ${PORT}`);
