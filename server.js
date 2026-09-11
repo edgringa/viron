@@ -1,19 +1,11 @@
 const express = require("express");
+const cors = require("cors");
 const { Pool } = require("pg");
-const axios = require("axios");
-const cheerio = require("cheerio");
 
 const app = express();
-const PORT = process.env.PORT || 10000;
 
+app.use(cors());
 app.use(express.json());
-
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  next();
-});
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -22,196 +14,265 @@ const pool = new Pool({
   }
 });
 
-const VIR0N_USER_AGENT =
-  "VironBot/0.1 (+https://viron.search)";
+// ===============================
+// VIRon API
+// ===============================
 
-
-app.get("/", (_req, res) => {
+app.get("/", (req, res) => {
   res.json({
     ok: true,
     service: "Viron API",
-    version: "0.8.1"
+    version: "0.9.0"
   });
 });
 
-
-app.get("/health", (_req, res) => {
+app.get("/health", (req, res) => {
   res.json({
-    status: "ok"
+    ok: true,
+    status: "online"
   });
 });
 
-
-app.get("/db-test", async (_req, res) => {
+app.get("/db-test", async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT NOW() AS now"
-    );
+    const result = await pool.query("SELECT NOW()");
 
     res.json({
       ok: true,
       database: "connected",
       time: result.rows[0].now
     });
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    });
+  }
+});
+
+// ===============================
+// CRIAR TABELA DE ANÚNCIOS
+// ===============================
+
+async function createAdsTable() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS viron_ads (
+      id SERIAL PRIMARY KEY,
+      campaign_name TEXT NOT NULL,
+      advertiser_name TEXT NOT NULL,
+      country VARCHAR(10) DEFAULT 'DE',
+      language VARCHAR(10) DEFAULT 'de',
+      keyword TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      final_url TEXT NOT NULL,
+      cpc NUMERIC(10,2) DEFAULT 0.10,
+      daily_budget NUMERIC(10,2) DEFAULT 5.00,
+      spent NUMERIC(10,2) DEFAULT 0,
+      clicks INTEGER DEFAULT 0,
+      impressions INTEGER DEFAULT 0,
+      status VARCHAR(20) DEFAULT 'active',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+// ===============================
+// CRIAR CAMPANHA
+// ===============================
+
+app.post("/ads/campaigns", async (req, res) => {
+  try {
+    const {
+      campaign_name,
+      advertiser_name,
+      country,
+      language,
+      keyword,
+      title,
+      description,
+      final_url,
+      cpc,
+      daily_budget
+    } = req.body;
+
+    if (
+      !campaign_name ||
+      !advertiser_name ||
+      !keyword ||
+      !title ||
+      !final_url
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios não preenchidos."
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO viron_ads
+      (
+        campaign_name,
+        advertiser_name,
+        country,
+        language,
+        keyword,
+        title,
+        description,
+        final_url,
+        cpc,
+        daily_budget
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+      RETURNING *
+      `,
+      [
+        campaign_name,
+        advertiser_name,
+        country || "DE",
+        language || "de",
+        keyword,
+        title,
+        description || "",
+        final_url,
+        Number(cpc) || 0.10,
+        Number(daily_budget) || 5
+      ]
+    );
+
+    res.json({
+      ok: true,
+      campaign: result.rows[0]
+    });
 
   } catch (error) {
     console.error(error);
 
     res.status(500).json({
       ok: false,
-      database: "error"
+      error: error.message
     });
   }
 });
 
+// ===============================
+// LISTAR CAMPANHAS
+// ===============================
 
-/*
-  VIRÓN SEARCH
-*/
-app.get("/search", async (req, res) => {
-  const query = String(
-    req.query.q || ""
-  ).trim();
+app.get("/ads/campaigns", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT *
+      FROM viron_ads
+      ORDER BY id DESC
+    `);
 
-  if (!query) {
-    return res.status(400).json({
+    res.json({
+      ok: true,
+      campaigns: result.rows
+    });
+
+  } catch (error) {
+    res.status(500).json({
       ok: false,
-      error: "Query is required"
+      error: error.message
     });
   }
+});
 
+// ===============================
+// BUSCA
+// ===============================
+
+app.get("/search", async (req, res) => {
   try {
-    const result = await pool.query(
+    const q = String(req.query.q || "").trim();
+
+    if (!q) {
+      return res.json({
+        ok: true,
+        query: "",
+        ads: [],
+        results: []
+      });
+    }
+
+    // ===========================
+    // ENCONTRAR ANÚNCIOS
+    // ===========================
+
+    const adsResult = await pool.query(
+      `
+      SELECT *
+      FROM viron_ads
+      WHERE status = 'active'
+      AND LOWER(keyword) = LOWER($1)
+      ORDER BY cpc DESC, id DESC
+      LIMIT 3
+      `,
+      [q]
+    );
+
+    // ===========================
+    // REGISTRAR IMPRESSÕES
+    // ===========================
+
+    if (adsResult.rows.length > 0) {
+      const ids = adsResult.rows.map(ad => ad.id);
+
+      await pool.query(
+        `
+        UPDATE viron_ads
+        SET impressions = impressions + 1
+        WHERE id = ANY($1::int[])
+        `,
+        [ids]
+      );
+    }
+
+    // ===========================
+    // RESULTADOS ORGÂNICOS
+    // ===========================
+
+    const searchResult = await pool.query(
       `
       SELECT
         id,
         title,
         url,
         description,
-
-        (
-          CASE
-            WHEN title ILIKE $1 THEN 100
-            WHEN title ILIKE $2 THEN 80
-            ELSE 0
-          END
-          +
-          CASE
-            WHEN description ILIKE $1 THEN 50
-            WHEN description ILIKE $2 THEN 30
-            ELSE 0
-          END
-          +
-          CASE
-            WHEN content ILIKE $1 THEN 20
-            WHEN content ILIKE $2 THEN 10
-            ELSE 0
-          END
-        ) AS relevance
-
+        CASE
+          WHEN LOWER(title) = LOWER($1) THEN 100
+          WHEN LOWER(title) LIKE LOWER($2) THEN 80
+          WHEN LOWER(description) LIKE LOWER($2) THEN 50
+          WHEN LOWER(content) LIKE LOWER($2) THEN 20
+          ELSE 10
+        END AS relevance
       FROM search_pages
-
       WHERE
-        title ILIKE $2
-        OR description ILIKE $2
-        OR content ILIKE $2
-
+        LOWER(title) LIKE LOWER($2)
+        OR LOWER(description) LIKE LOWER($2)
+        OR LOWER(content) LIKE LOWER($2)
       ORDER BY relevance DESC, id DESC
-
       LIMIT 10
       `,
-      [
-        query,
-        `%${query}%`
-      ]
+      [q, `%${q}%`]
     );
 
     res.json({
       ok: true,
-      query,
-      results: result.rows.map(row => ({
-        title: row.title,
-        url: row.url,
-        description: row.description,
-        relevance: Number(row.relevance)
-      }))
-    });
+      query: q,
 
-  } catch (error) {
-    console.error(
-      "Search error:",
-      error
-    );
+      ads: adsResult.rows.map(ad => ({
+        id: ad.id,
+        title: ad.title,
+        description: ad.description,
+        url: ad.final_url,
+        advertiser: ad.advertiser_name
+      })),
 
-    res.status(500).json({
-      ok: false,
-      error: "Search database error"
-    });
-  }
-});
-
-
-/*
-  ADICIONA UMA URL À FILA
-*/
-app.post("/crawl", async (req, res) => {
-  const url = String(
-    req.body.url || ""
-  ).trim();
-
-  if (!url) {
-    return res.status(400).json({
-      ok: false,
-      error: "URL is required"
-    });
-  }
-
-  try {
-    const parsedUrl = new URL(url);
-
-    if (
-      !["http:", "https:"].includes(
-        parsedUrl.protocol
-      )
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Only HTTP and HTTPS URLs are allowed"
-      });
-    }
-
-  } catch {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid URL"
-    });
-  }
-
-  try {
-    const result = await pool.query(
-      `
-      INSERT INTO crawl_queue
-      (url, status)
-      VALUES ($1, 'pending')
-      ON CONFLICT (url)
-      DO NOTHING
-      RETURNING id, url, status
-      `,
-      [url]
-    );
-
-    if (result.rows.length === 0) {
-      return res.json({
-        ok: true,
-        message: "URL already in crawl queue",
-        url
-      });
-    }
-
-    res.json({
-      ok: true,
-      message: "URL added to crawl queue",
-      item: result.rows[0]
+      results: searchResult.rows
     });
 
   } catch (error) {
@@ -219,619 +280,68 @@ app.post("/crawl", async (req, res) => {
 
     res.status(500).json({
       ok: false,
-      error: "Crawl queue database error"
+      error: error.message
     });
   }
 });
 
+// ===============================
+// CLIQUE NO ANÚNCIO
+// ===============================
 
-/*
-  DESCOBERTA AUTOMÁTICA DE SITEMAPS
-*/
-app.post("/discover", async (req, res) => {
-  const inputUrl = String(
-    req.body.url || ""
-  ).trim();
-
-  if (!inputUrl) {
-    return res.status(400).json({
-      ok: false,
-      error: "URL is required"
-    });
-  }
-
-  let parsedUrl;
-
+app.get("/ads/click/:id", async (req, res) => {
   try {
-    parsedUrl = new URL(inputUrl);
+    const id = Number(req.params.id);
 
-    if (
-      !["http:", "https:"].includes(
-        parsedUrl.protocol
-      )
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "Only HTTP and HTTPS URLs are allowed"
-      });
-    }
-
-  } catch {
-    return res.status(400).json({
-      ok: false,
-      error: "Invalid URL"
-    });
-  }
-
-  const origin = parsedUrl.origin;
-
-  try {
-
-    /*
-      URLs descobertas ficam aqui.
-    */
-    const discoveredUrls = new Set();
-
-    /*
-      Sitemaps já processados.
-      Evita loop e duplicação.
-    */
-    const processedSitemaps = new Set();
-
-    /*
-      Descobre sitemaps pelo robots.txt.
-    */
-    const robotsUrl =
-      `${origin}/robots.txt`;
-
-    let robotsText = "";
-
-    try {
-      const robotsResponse =
-        await axios.get(
-          robotsUrl,
-          {
-            timeout: 10000,
-            maxContentLength:
-              1024 * 1024,
-            headers: {
-              "User-Agent":
-                VIR0N_USER_AGENT
-            }
-          }
-        );
-
-      robotsText = String(
-        robotsResponse.data || ""
-      );
-
-    } catch {
-      robotsText = "";
-    }
-
-    const sitemapUrls = [];
-
-    /*
-      Procura:
-      Sitemap: https://...
-    */
-    for (
-      const line of robotsText.split(/\r?\n/)
-    ) {
-
-      if (
-        line
-          .trim()
-          .toLowerCase()
-          .startsWith("sitemap:")
-      ) {
-
-        const sitemap =
-          line
-            .substring(8)
-            .trim();
-
-        try {
-
-          const sitemapUrl =
-            new URL(
-              sitemap,
-              origin
-            );
-
-          if (
-            ["http:", "https:"].includes(
-              sitemapUrl.protocol
-            )
-          ) {
-            sitemapUrls.push(
-              sitemapUrl.href
-            );
-          }
-
-        } catch {}
-      }
-    }
-
-
-    /*
-      Se robots.txt não informou sitemap,
-      tenta os caminhos comuns.
-    */
-    if (sitemapUrls.length === 0) {
-
-      sitemapUrls.push(
-        `${origin}/sitemap.xml`,
-        `${origin}/sitemap_index.xml`
-      );
-    }
-
-
-    const uniqueSitemaps = [
-      ...new Set(sitemapUrls)
-    ];
-
-
-    /*
-      Lê um sitemap.
-      Agora usamos await corretamente,
-      inclusive para sitemap index.
-    */
-    async function readSitemap(
-      sitemapUrl,
-      depth = 0
-    ) {
-
-      if (depth > 3) {
-        return;
-      }
-
-      if (
-        processedSitemaps.has(
-          sitemapUrl
-        )
-      ) {
-        return;
-      }
-
-      processedSitemaps.add(
-        sitemapUrl
-      );
-
-      try {
-
-        console.log(
-          `Reading sitemap: ${sitemapUrl}`
-        );
-
-        const response =
-          await axios.get(
-            sitemapUrl,
-            {
-              timeout: 15000,
-              maxContentLength:
-                5 * 1024 * 1024,
-              headers: {
-                "User-Agent":
-                  VIR0N_USER_AGENT
-              }
-            }
-          );
-
-        const xml = String(
-          response.data || ""
-        );
-
-        const $ = cheerio.load(
-          xml,
-          {
-            xmlMode: true
-          }
-        );
-
-
-        /*
-          Primeiro verifica se é
-          sitemap index.
-        */
-        const childSitemaps = [];
-
-        $("sitemap loc").each(
-          (_i, element) => {
-
-            const child =
-              $(element)
-                .text()
-                .trim();
-
-            if (child) {
-              childSitemaps.push(
-                child
-              );
-            }
-          }
-        );
-
-
-        /*
-          Processa todos os sitemaps filhos
-          e ESPERA todos terminarem.
-        */
-        if (
-          childSitemaps.length > 0
-        ) {
-
-          await Promise.all(
-            childSitemaps.map(
-              child =>
-                readSitemap(
-                  child,
-                  depth + 1
-                )
-            )
-          );
-        }
-
-
-        /*
-          Extrai URLs normais.
-        */
-        $("url loc").each(
-          (_i, element) => {
-
-            const pageUrl =
-              $(element)
-                .text()
-                .trim();
-
-            if (!pageUrl) {
-              return;
-            }
-
-            try {
-
-              const parsed =
-                new URL(
-                  pageUrl,
-                  origin
-                );
-
-              if (
-                ["http:", "https:"].includes(
-                  parsed.protocol
-                )
-              ) {
-
-                discoveredUrls.add(
-                  parsed.href
-                );
-              }
-
-            } catch {}
-          }
-        );
-
-      } catch (error) {
-
-        console.error(
-          `Sitemap error: ${sitemapUrl}`,
-          error.message
-        );
-      }
-    }
-
-
-    /*
-      Processa os sitemaps encontrados.
-    */
-    await Promise.all(
-      uniqueSitemaps.map(
-        sitemap =>
-          readSitemap(
-            sitemap
-          )
-      )
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM viron_ads
+      WHERE id = $1
+      AND status = 'active'
+      LIMIT 1
+      `,
+      [id]
     );
 
-
-    /*
-      Limite inicial:
-      máximo 500 URLs por descoberta.
-    */
-    const urlsToQueue = [
-      ...discoveredUrls
-    ].slice(0, 500);
-
-
-    let added = 0;
-    let existing = 0;
-
-
-    /*
-      Coloca URLs na fila.
-    */
-    for (
-      const url of urlsToQueue
-    ) {
-
-      const result =
-        await pool.query(
-          `
-          INSERT INTO crawl_queue
-          (url, status)
-          VALUES ($1, 'pending')
-          ON CONFLICT (url)
-          DO NOTHING
-          RETURNING id
-          `,
-          [url]
-        );
-
-      if (
-        result.rows.length > 0
-      ) {
-        added++;
-      } else {
-        existing++;
-      }
+    if (result.rows.length === 0) {
+      return res.status(404).send("Anúncio não encontrado.");
     }
 
+    const ad = result.rows[0];
 
-    res.json({
-      ok: true,
-      domain: origin,
-      sitemaps_found:
-        uniqueSitemaps,
-      sitemaps_processed:
-        processedSitemaps.size,
-      urls_discovered:
-        discoveredUrls.size,
-      urls_added:
-        added,
-      urls_already_in_queue:
-        existing,
-      limit: 500
-    });
+    await pool.query(
+      `
+      UPDATE viron_ads
+      SET clicks = clicks + 1,
+          spent = spent + cpc
+      WHERE id = $1
+      `,
+      [id]
+    );
 
+    res.redirect(ad.final_url);
 
   } catch (error) {
+    console.error(error);
 
-    console.error(
-      "Discovery error:",
-      error
-    );
-
-    res.status(500).json({
-      ok: false,
-      error: "Discovery error"
-    });
+    res.status(500).send("Erro ao processar clique.");
   }
 });
 
+// ===============================
+// INICIALIZAÇÃO
+// ===============================
 
-/*
-  PROCESSA UMA URL PENDENTE
-*/
-async function processNextUrl() {
+const PORT = process.env.PORT || 10000;
 
-  let client;
-
-  try {
-
-    client =
-      await pool.connect();
-
-    await client.query(
-      "BEGIN"
-    );
-
-    const queueResult =
-      await client.query(
-        `
-        SELECT id, url
-        FROM crawl_queue
-        WHERE status = 'pending'
-        ORDER BY id ASC
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
-        `
-      );
-
-    if (
-      queueResult.rows.length === 0
-    ) {
-
-      await client.query(
-        "ROLLBACK"
-      );
-
-      return;
-    }
-
-    const item =
-      queueResult.rows[0];
-
-
-    await client.query(
-      `
-      UPDATE crawl_queue
-      SET status = 'processing'
-      WHERE id = $1
-      `,
-      [item.id]
-    );
-
-
-    await client.query(
-      "COMMIT"
-    );
-
-
-    console.log(
-      `Crawling: ${item.url}`
-    );
-
-
-    const response =
-      await axios.get(
-        item.url,
-        {
-          timeout: 15000,
-          maxContentLength:
-            5 * 1024 * 1024,
-          headers: {
-            "User-Agent":
-              VIR0N_USER_AGENT
-          }
-        }
-      );
-
-
-    const $ =
-      cheerio.load(
-        response.data
-      );
-
-
-    $("script, style, noscript")
-      .remove();
-
-
-    const title =
-      $("title")
-        .first()
-        .text()
-        .trim() ||
-      item.url;
-
-
-    const description =
-      $('meta[name="description"]')
-        .attr("content")
-        ?.trim() ||
-      "";
-
-
-    const content =
-      $("body")
-        .text()
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 50000);
-
-
-    const language =
-      $("html")
-        .attr("lang")
-        ?.trim() ||
-      null;
-
-
-    await pool.query(
-      `
-      INSERT INTO search_pages
-      (title, url, description, content, language, country)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      `,
-      [
-        title,
-        item.url,
-        description,
-        content,
-        language,
-        null
-      ]
-    );
-
-
-    await pool.query(
-      `
-      UPDATE crawl_queue
-      SET status = 'completed'
-      WHERE id = $1
-      `,
-      [item.id]
-    );
-
-
-    console.log(
-      `Indexed successfully: ${item.url}`
-    );
-
-
-  } catch (error) {
-
-    console.error(
-      "Crawler error:",
-      error.message
-    );
-
-
-    if (client) {
-
-      try {
-        await client.query(
-          "ROLLBACK"
-        );
-      } catch {}
-    }
-
-
-    try {
-
-      await pool.query(
-        `
-        UPDATE crawl_queue
-        SET status = 'error'
-        WHERE status = 'processing'
-        AND id = (
-          SELECT id
-          FROM crawl_queue
-          WHERE status = 'processing'
-          ORDER BY id ASC
-          LIMIT 1
-        )
-        `
-      );
-
-    } catch (updateError) {
-
-      console.error(
-        "Queue update error:",
-        updateError.message
-      );
-    }
-
-
-  } finally {
-
-    if (client) {
-      client.release();
-    }
-  }
-}
-
-
-/*
-  CRAWLER
-*/
-setInterval(
-  processNextUrl,
-  10000
-);
-
-
-/*
-  INICIA API
-*/
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-
-    console.log(
-      `Viron API running on port ${PORT}`
-    );
-
-  }
-);
+createAdsTable()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Viron API online na porta ${PORT}`);
+    });
+  })
+  .catch(error => {
+    console.error("Erro ao iniciar banco:", error);
+    process.exit(1);
+  });
