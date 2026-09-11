@@ -26,7 +26,7 @@ app.get("/", (_req, res) => {
   res.json({
     ok: true,
     service: "Viron API",
-    version: "0.7.0"
+    version: "0.8.0"
   });
 });
 
@@ -58,10 +58,6 @@ app.get("/db-test", async (_req, res) => {
 
 /*
   VIRÓN SEARCH
-  Busca por relevância:
-  - título = peso maior
-  - descrição = peso médio
-  - conteúdo = peso menor
 */
 app.get("/search", async (req, res) => {
   const query = String(req.query.q || "").trim();
@@ -142,7 +138,7 @@ app.get("/search", async (req, res) => {
 
 
 /*
-  Adiciona URL à fila do crawler.
+  ADICIONA UMA URL À FILA
 */
 app.post("/crawl", async (req, res) => {
   const url = String(req.body.url || "").trim();
@@ -209,7 +205,255 @@ app.post("/crawl", async (req, res) => {
 
 
 /*
-  Processa uma URL pendente.
+  DESCOBRE SITEMAPS E IMPORTA URLs
+*/
+app.post("/discover", async (req, res) => {
+  const inputUrl = String(req.body.url || "").trim();
+
+  if (!inputUrl) {
+    return res.status(400).json({
+      ok: false,
+      error: "URL is required"
+    });
+  }
+
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(inputUrl);
+
+    if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Only HTTP and HTTPS URLs are allowed"
+      });
+    }
+
+  } catch {
+    return res.status(400).json({
+      ok: false,
+      error: "Invalid URL"
+    });
+  }
+
+  const origin = parsedUrl.origin;
+
+  try {
+    /*
+      Primeiro tenta descobrir o sitemap pelo robots.txt.
+    */
+    const robotsUrl = `${origin}/robots.txt`;
+
+    let robotsText = "";
+
+    try {
+      const robotsResponse = await axios.get(robotsUrl, {
+        timeout: 10000,
+        maxContentLength: 1024 * 1024,
+        headers: {
+          "User-Agent": "VironBot/0.1 (+https://viron.search)"
+        }
+      });
+
+      robotsText = String(robotsResponse.data || "");
+    } catch {
+      robotsText = "";
+    }
+
+    /*
+      Procura linhas Sitemap: no robots.txt
+    */
+    const sitemapUrls = [];
+
+    for (const line of robotsText.split(/\r?\n/)) {
+      if (line.toLowerCase().startsWith("sitemap:")) {
+        const sitemap = line.substring(8).trim();
+
+        try {
+          const sitemapUrl = new URL(sitemap, origin);
+
+          if (
+            ["http:", "https:"].includes(
+              sitemapUrl.protocol
+            )
+          ) {
+            sitemapUrls.push(sitemapUrl.href);
+          }
+
+        } catch {}
+      }
+    }
+
+    /*
+      Se não encontrou no robots.txt,
+      tenta os caminhos comuns.
+    */
+    if (sitemapUrls.length === 0) {
+      sitemapUrls.push(
+        `${origin}/sitemap.xml`,
+        `${origin}/sitemap_index.xml`
+      );
+    }
+
+    /*
+      Remove duplicadas.
+    */
+    const uniqueSitemaps = [
+      ...new Set(sitemapUrls)
+    ];
+
+    const discoveredUrls = new Set();
+
+    /*
+      Lê sitemap ou sitemap index.
+    */
+    async function readSitemap(sitemapUrl, depth = 0) {
+      if (depth > 2) {
+        return;
+      }
+
+      try {
+        const response = await axios.get(
+          sitemapUrl,
+          {
+            timeout: 15000,
+            maxContentLength: 5 * 1024 * 1024,
+            headers: {
+              "User-Agent":
+                "VironBot/0.1 (+https://viron.search)"
+            }
+          }
+        );
+
+        const xml = String(response.data || "");
+
+        const $ = cheerio.load(
+          xml,
+          {
+            xmlMode: true
+          }
+        );
+
+        /*
+          Sitemap index
+        */
+        $("sitemap loc").each((_i, element) => {
+          const childSitemap =
+            $(element).text().trim();
+
+          if (childSitemap) {
+            readSitemap(
+              childSitemap,
+              depth + 1
+            );
+          }
+        });
+
+        /*
+          URLs normais
+        */
+        $("url loc").each((_i, element) => {
+          const pageUrl =
+            $(element).text().trim();
+
+          if (!pageUrl) {
+            return;
+          }
+
+          try {
+            const parsed = new URL(
+              pageUrl,
+              origin
+            );
+
+            if (
+              ["http:", "https:"].includes(
+                parsed.protocol
+              )
+            ) {
+              discoveredUrls.add(
+                parsed.href
+              );
+            }
+
+          } catch {}
+        });
+
+      } catch (error) {
+        console.error(
+          `Sitemap error: ${sitemapUrl}`,
+          error.message
+        );
+      }
+    }
+
+    /*
+      Processa os sitemaps encontrados.
+    */
+    for (const sitemapUrl of uniqueSitemaps) {
+      await readSitemap(sitemapUrl);
+    }
+
+    /*
+      Limite inicial para manter o projeto
+      dentro dos recursos gratuitos.
+    */
+    const urlsToQueue = [
+      ...discoveredUrls
+    ].slice(0, 500);
+
+    let added = 0;
+    let existing = 0;
+
+    /*
+      Coloca as URLs na fila.
+    */
+    for (const url of urlsToQueue) {
+      const result = await pool.query(
+        `
+        INSERT INTO crawl_queue
+        (url, status)
+        VALUES ($1, 'pending')
+        ON CONFLICT (url)
+        DO NOTHING
+        RETURNING id
+        `,
+        [url]
+      );
+
+      if (result.rows.length > 0) {
+        added++;
+      } else {
+        existing++;
+      }
+    }
+
+    res.json({
+      ok: true,
+      domain: origin,
+      sitemaps_found: uniqueSitemaps,
+      urls_discovered: discoveredUrls.size,
+      urls_added: added,
+      urls_already_in_queue: existing,
+      limit: 500
+    });
+
+  } catch (error) {
+    console.error(
+      "Discovery error:",
+      error
+    );
+
+    res.status(500).json({
+      ok: false,
+      error: "Discovery error"
+    });
+  }
+});
+
+
+/*
+  PROCESSA UMA URL PENDENTE
 */
 async function processNextUrl() {
   let client;
@@ -248,26 +492,39 @@ async function processNextUrl() {
 
     await client.query("COMMIT");
 
-    console.log(`Crawling: ${item.url}`);
+    console.log(
+      `Crawling: ${item.url}`
+    );
 
-    const response = await axios.get(item.url, {
-      timeout: 15000,
-      maxContentLength: 5 * 1024 * 1024,
-      headers: {
-        "User-Agent": "VironBot/0.1 (+https://viron.search)"
+    const response = await axios.get(
+      item.url,
+      {
+        timeout: 15000,
+        maxContentLength: 5 * 1024 * 1024,
+        headers: {
+          "User-Agent":
+            "VironBot/0.1 (+https://viron.search)"
+        }
       }
-    });
+    );
 
-    const $ = cheerio.load(response.data);
+    const $ = cheerio.load(
+      response.data
+    );
 
     $("script, style, noscript").remove();
 
     const title =
-      $("title").first().text().trim() ||
+      $("title")
+        .first()
+        .text()
+        .trim() ||
       item.url;
 
     const description =
-      $('meta[name="description"]').attr("content")?.trim() ||
+      $('meta[name="description"]')
+        .attr("content")
+        ?.trim() ||
       "";
 
     const content =
@@ -278,7 +535,10 @@ async function processNextUrl() {
         .slice(0, 50000);
 
     const language =
-      $("html").attr("lang")?.trim() || null;
+      $("html")
+        .attr("lang")
+        ?.trim() ||
+      null;
 
     await pool.query(
       `
@@ -305,15 +565,22 @@ async function processNextUrl() {
       [item.id]
     );
 
-    console.log(`Indexed successfully: ${item.url}`);
+    console.log(
+      `Indexed successfully: ${item.url}`
+    );
 
   } catch (error) {
 
-    console.error("Crawler error:", error.message);
+    console.error(
+      "Crawler error:",
+      error.message
+    );
 
     if (client) {
       try {
-        await client.query("ROLLBACK");
+        await client.query(
+          "ROLLBACK"
+        );
       } catch {}
     }
 
@@ -338,25 +605,35 @@ async function processNextUrl() {
         updateError.message
       );
     }
+
   } finally {
+
     if (client) {
       client.release();
     }
+
   }
 }
 
 
 /*
-  Executa o crawler periodicamente.
+  EXECUTA O CRAWLER PERIODICAMENTE
 */
-setInterval(processNextUrl, 10000);
+setInterval(
+  processNextUrl,
+  10000
+);
 
 
 /*
-  Inicia a API.
+  INICIA A API
 */
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(
-    `Viron API running on port ${PORT}`
-  );
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Viron API running on port ${PORT}`
+    );
+  }
+);
